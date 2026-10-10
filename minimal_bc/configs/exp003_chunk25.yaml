@@ -1,0 +1,27 @@
+# exp003: action chunking (hand-written implementation), chunk_size 25. Only change vs. exp001: chunk_size 1 -> 25.
+# Runs go to runs/<experiment name>/seed<seed>. Paths are relative to /root/mm_model.
+data:
+  train_path: data/block-single-task1-v0-10k.npz
+  valid_path: data/block-single-task1-v0-10k-val.npz
+
+model:
+  hidden_dim: 512
+  depth: 10
+  layer_norm: true
+
+train:
+  device: cuda
+  seed: 0  # training seed; overridden by the command line, e.g. train.py <config> 1
+  lr: 5.0e-4  # write floats with a dot: YAML reads "5e-4" as a string
+  batch_size: 1024
+  n_steps: 10000
+  print_every: 100
+  valid_every: 500
+  save_every: 5000
+  chunk_size: 25
+
+eval:
+  env_name: block-cpu-single-task1-v0  # CPU version of the task the data was generated on
+  n_episodes: 50
+  n_videos: 3  # render the first n episodes to mp4
+  seed: 0  # eval seeds are seed..seed+n_episodes-1; keep fixed so every run sees the same 50 initial states

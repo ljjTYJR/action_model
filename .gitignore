@@ -1,0 +1,19 @@
+# Datasets (~28 GB), regenerate with gen_data.sh
+data/
+
+# Cloned OCBench repo, has its own git history
+ocbench/
+
+# Run outputs (checkpoints, videos, logs, code snapshots); keep only the results table
+runs/*
+!runs/results.csv
+
+# Generated files
+*.mp4
+*.png
+*.log
+*.pt
+
+# Python
+__pycache__/
+*.pyc
