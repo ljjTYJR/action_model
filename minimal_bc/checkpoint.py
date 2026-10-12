@@ -25,9 +25,10 @@ def save_checkpoint(run_dir, model, model_kwargs, act_normalizer, config, step):
     print(f"saved checkpoint at step {step} to {run_dir}")
 
 
-def load_checkpoint(path, device='cuda'):
+def load_checkpoint(path, device='cuda', model_cls=BCModel):
+    # model_cls: BCModel (MSE policy) or BCFlowModel (flow policy); both are built from the saved kwargs
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = BCModel(**ckpt['model_kwargs']).to(device)
+    model = model_cls(**ckpt['model_kwargs']).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
     act_normalizer = ActionNormalizer(ckpt['act_center'], ckpt['act_half_range'], ckpt['act_clip'])

@@ -45,6 +45,26 @@ class BCModel(nn.Module):
             h = out if i == 0 else h + out
         return self.net[-1](h)
 
+class BCFlowModel(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_dim, depth):
+        super().__init__()
+        input_dim = obs_dim + act_dim + 1
+        self.inp = nn.Linear(input_dim, hidden_dim)
+        self.blocks = nn.ModuleList(
+            nn.Sequential(nn.LayerNorm(hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)) for _ in range(depth-1)
+        )
+        self.output = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, act_dim))
+
+    def forward(self, obs, xt, t): # velocity field model
+        # TODO: t encoding
+        t = t
+        inputs = torch.cat([obs, xt, t], dim=1)
+        h = self.inp(inputs)
+        for block in self.blocks:
+            h = h + block(h)
+        out = self.output(h)
+        return out
+
 if __name__ == '__main__':
     model = BCModel()
     out = model(torch.randn(4, 28))
