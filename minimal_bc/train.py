@@ -60,6 +60,11 @@ if __name__ == '__main__':
     act_dim = acts.shape[-1] * chunk_size # multiple actions predictions
     model_kwargs = dict(obs_dim=obs_dim, act_dim=act_dim, **config['model'])
     bc_model = BCModel(**model_kwargs).to(device)
+    # Speed only, same method: tf32 = TF32 matmuls (10-bit mantissa); compile = CUDA graphs for the
+    # training step (fixed batch shape). Validation, checkpoints and evaluation use the eager model.
+    if train_cfg.get('tf32'):
+        torch.set_float32_matmul_precision('high')
+    train_model = torch.compile(bc_model, mode='reduce-overhead') if train_cfg.get('compile') else bc_model
 
     # train loop
     optimizer = torch.optim.AdamW(
@@ -71,6 +76,10 @@ if __name__ == '__main__':
     batch_size = train_cfg['batch_size']
     n_steps = train_cfg['n_steps']
     logger = Logger(print_every=train_cfg['print_every'])
+    # keep_every: also keep ckpt_<step>.pt every keep_every steps (and at step 0), for success-vs-steps curves
+    keep_every = train_cfg.get('keep_every')
+    if keep_every:
+        save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, 0, name='ckpt_0.pt')
     for step in range(n_steps):
         optimizer.zero_grad()
         idx = torch.randint(0, N, (batch_size,), device=device)
@@ -79,7 +88,7 @@ if __name__ == '__main__':
         gt_act = acts[chunk_idx] # (B, 25, 7)
         gt_act = gt_act.flatten(1)
 
-        pred_act = bc_model(obs_batch)
+        pred_act = train_model(obs_batch)
         loss = ((pred_act - gt_act) ** 2).mean()
         loss.backward()
         optimizer.step()
@@ -96,6 +105,8 @@ if __name__ == '__main__':
         # periodic checkpoint, overwritten each time so the run dir always has the latest one
         if (step + 1) % train_cfg['save_every'] == 0 and step + 1 < n_steps:
             save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, step + 1)
+        if keep_every and (step + 1) % keep_every == 0:
+            save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, step + 1, name=f'ckpt_{step + 1}.pt')
 
     save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, n_steps)
     logger.plot(os.path.join(run_dir, 'loss.png'))

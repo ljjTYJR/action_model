@@ -6,7 +6,7 @@ from model import BCModel
 from preprocess import ActionNormalizer
 
 
-def save_checkpoint(run_dir, model, model_kwargs, act_normalizer, config, step):
+def save_checkpoint(run_dir, model, model_kwargs, act_normalizer, config, step, name='ckpt.pt'):
     # ckpt.pt holds the weights, the model arguments and the action normalizer statistics,
     # so evaluation can rebuild the exact same model and map its outputs back to env actions.
     os.makedirs(run_dir, exist_ok=True)
@@ -18,11 +18,11 @@ def save_checkpoint(run_dir, model, model_kwargs, act_normalizer, config, step):
         'act_half_range': act_normalizer.half_range,
         'act_clip': act_normalizer.clip,
         'config': config,
-    }, os.path.join(run_dir, 'ckpt.pt'))
+    }, os.path.join(run_dir, name))
     # A readable copy of the config next to the checkpoint.
     with open(os.path.join(run_dir, 'config.yaml'), 'w') as f:
         yaml.safe_dump(config, f, sort_keys=False)
-    print(f"saved checkpoint at step {step} to {run_dir}")
+    print(f"saved checkpoint at step {step} to {os.path.join(run_dir, name)}")
 
 
 def load_checkpoint(path, device='cuda', model_cls=BCModel):

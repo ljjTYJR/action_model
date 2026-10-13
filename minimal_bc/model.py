@@ -1,5 +1,15 @@
+import math
 import torch
 from torch import nn
+
+
+def time_embedding(t, dim):
+    # Sinusoidal features of t in [0, 1], as for diffusion timesteps (DiT):
+    # [sin(1000 t w_k), cos(1000 t w_k)], w_k = 10000^(-k / (dim/2)), k = 0 .. dim/2 - 1
+    freqs = torch.exp(-math.log(10000) * torch.arange(dim // 2, device=t.device) / (dim // 2))
+    angles = 1000 * t * freqs  # (B, dim/2)
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)
+
 
 class BCModel(nn.Module):
     # residual: False = plain MLP; True = skip connection around each hidden layer of the plain MLP
@@ -46,22 +56,41 @@ class BCModel(nn.Module):
         return self.net[-1](h)
 
 class BCFlowModel(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_dim, depth):
+    def __init__(self, obs_dim, act_dim, hidden_dim, depth, film=False, t_embed_dim=0, cond_input=True):
         super().__init__()
-        input_dim = obs_dim + act_dim + 1
+        # t_embed_dim: 0 = feed t as a raw scalar; > 0 = feed t_embed_dim sinusoidal features of t
+        self.t_embed_dim = t_embed_dim
+        t_dim = t_embed_dim or 1
+        # cond_input: concatenate [obs, t] with x_t at the input; False = the input is x_t only,
+        # and obs and t enter only through FiLM (standard FiLM conditioning, needs film=True)
+        self.cond_input = cond_input
+        input_dim = act_dim + (obs_dim + t_dim if cond_input else 0)
         self.inp = nn.Linear(input_dim, hidden_dim)
         self.blocks = nn.ModuleList(
             nn.Sequential(nn.LayerNorm(hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim)) for _ in range(depth-1)
         )
         self.output = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, act_dim))
+        # film: [obs, t] also gives a scale and shift after the LayerNorm of every block.
+        # Zero-initialized, so training starts from the same function as without FiLM.
+        self.film = None
+        if film:
+            self.film = nn.ModuleList(nn.Linear(obs_dim + t_dim, 2 * hidden_dim) for _ in range(depth - 1))
+            for layer in self.film:
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
 
     def forward(self, obs, xt, t): # velocity field model
-        # TODO: t encoding
-        t = t
-        inputs = torch.cat([obs, xt, t], dim=1)
-        h = self.inp(inputs)
-        for block in self.blocks:
-            h = h + block(h)
+        if self.t_embed_dim:
+            t = time_embedding(t, self.t_embed_dim)
+        h = self.inp(torch.cat([obs, xt, t], dim=1) if self.cond_input else xt)
+        cond = torch.cat([obs, t], dim=1)
+        for i, block in enumerate(self.blocks):
+            if self.film is None:
+                h = h + block(h)
+            else:
+                scale, shift = self.film[i](cond).chunk(2, dim=1)
+                z = block[0](h) * (1 + scale) + shift  # LayerNorm, then FiLM
+                h = h + block[2](block[1](z))  # ReLU, Linear
         out = self.output(h)
         return out
 

@@ -16,17 +16,20 @@ from model import BCFlowModel
 
 
 @torch.no_grad()
-def sample_chunk(model, obs, act_dim, flow_steps, generator):
+def sample_chunk(model, obs, act_dim, flow_steps, generator, pred='v'):
     # x_{t+dt} = x_t + v(obs, x_t, t) * dt on a uniform t grid, starting from x_0 ~ N(0, I)
     x = torch.randn(obs.shape[0], act_dim, generator=generator, device=obs.device)
     dt = 1.0 / flow_steps
     for i in range(flow_steps):
         t = torch.full((obs.shape[0], 1), i * dt, device=obs.device)
-        x = x + model(obs, x, t) * dt
+        out = model(obs, x, t)
+        # pred 'x': the model predicts the clean chunk x1, and the velocity points from x_t to it
+        v = (out - x) / (1 - i * dt) if pred == 'x' else out
+        x = x + v * dt
     return x
 
 
-def run_episode(env, model, act_normalizer, chunk_size, execute_steps, flow_steps, seed, device, render=False):
+def run_episode(env, model, act_normalizer, chunk_size, execute_steps, flow_steps, pred, seed, device, render=False):
     obs, info = env.reset(seed=seed)
     generator = torch.Generator(device=device).manual_seed(seed)  # sampling noise, reproducible per episode
     act_dim = len(act_normalizer.center) * chunk_size
@@ -34,9 +37,9 @@ def run_episode(env, model, act_normalizer, chunk_size, execute_steps, flow_step
     done, success, length = False, False, 0
     while not done:
         obs_t = torch.from_numpy(obs.astype(np.float32)).to(device)[None]
-        pred = sample_chunk(model, obs_t, act_dim, flow_steps, generator)[0].cpu().numpy()
+        pred_chunk = sample_chunk(model, obs_t, act_dim, flow_steps, generator, pred)[0].cpu().numpy()
         # normalized chunk sample -> (chunk_size, 7) env actions in [-1, 1]
-        actions = act_normalizer.unnormalize(pred.reshape(chunk_size, -1))
+        actions = act_normalizer.unnormalize(pred_chunk.reshape(chunk_size, -1))
         for action in actions[:execute_steps]:  # execute the first steps of the chunk open-loop, then sample again
             obs, _, terminated, truncated, info = env.step(action)
             success = success or bool(info['success'])
@@ -71,12 +74,13 @@ if __name__ == '__main__':
     chunk_size = ckpt_config['train']['chunk_size']  # use what the model was trained with
     execute_steps = eval_cfg.get('execute_steps', chunk_size)  # actions executed per chunk before sampling again
     flow_steps = eval_cfg['flow_steps']  # Euler steps per sampled chunk
+    pred = ckpt_config['train'].get('pred', 'v')  # what the network predicts: velocity or clean chunk
     env = ocbench.make(eval_cfg['env_name'], width=512, height=512)
 
     successes, lengths = [], []
     for ep in range(eval_cfg['n_episodes']):
         render = ep < eval_cfg['n_videos']
-        success, length, frames = run_episode(env, model, act_normalizer, chunk_size, execute_steps, flow_steps,
+        success, length, frames = run_episode(env, model, act_normalizer, chunk_size, execute_steps, flow_steps, pred,
                                                eval_cfg['seed'] + ep, device, render)
         successes.append(success)
         lengths.append(length)

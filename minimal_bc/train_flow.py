@@ -1,4 +1,5 @@
 import os
+import copy
 import sys
 import json
 import shutil
@@ -17,6 +18,14 @@ def get_chunk_idx(idx, chunk_size, ends):
     k = torch.searchsorted(ends, idx, right=True) # return which eposide inside
     chunk_idx = torch.minimum(idx[:, None] + torch.arange(chunk_size, device=device), (ends[k]-1)[:,None]) # (B,25), (B,)
     return chunk_idx
+
+def sample_t(n, dist):
+    # 'uniform': t ~ U[0, 1]. 'beta' (as in pi0): t = 0.999 * (1 - u), u ~ Beta(1.5, 1),
+    # which puts more weight on noisy (small) t, where the action depends most on the observation.
+    if dist == 'beta':
+        u = torch.distributions.Beta(torch.tensor(1.5, device=device), torch.tensor(1.0, device=device)).sample((n, 1))
+        return 0.999 * (1 - u)
+    return torch.rand(n, 1, device=device)
 
 if __name__ == '__main__':
     # usage: python minimal_bc/train.py <config.yaml> [seed]
@@ -60,13 +69,26 @@ if __name__ == '__main__':
     act_dim = acts.shape[-1] * chunk_size # multiple actions predictions
     model_kwargs = dict(obs_dim=obs_dim, act_dim=act_dim, **config['model'])
     bc_model = BCFlowModel(**model_kwargs).to(device)
+    # Speed only, same method: tf32 = TF32 matmuls (10-bit mantissa); compile = CUDA graphs for the
+    # training step (fixed batch shape). Validation, checkpoints and evaluation use the eager model.
+    if train_cfg.get('tf32'):
+        torch.set_float32_matmul_precision('high')
+    train_model = torch.compile(bc_model, mode='reduce-overhead') if train_cfg.get('compile') else bc_model
 
     # train loop
     optimizer = torch.optim.AdamW(
         bc_model.parameters(),
         lr = train_cfg['lr'],
     )
+    # lr_schedule: 'constant' (default) or 'cosine' (decay from lr to 0 over n_steps)
+    scheduler = None
+    if train_cfg.get('lr_schedule') == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=train_cfg['n_steps'])
     bc_model.train()
+    # ema_decay: validate and save an exponential moving average of the weights (None = the raw weights)
+    ema_decay = train_cfg.get('ema_decay')
+    eval_model = copy.deepcopy(bc_model) if ema_decay else bc_model
+    ema_params, params = list(eval_model.parameters()), list(bc_model.parameters())
 
     batch_size = train_cfg['batch_size']
     n_steps = train_cfg['n_steps']
@@ -77,6 +99,23 @@ if __name__ == '__main__':
     valid_x0 = torch.randn(valid_acts.shape, generator=g, device=device)
     valid_t = torch.rand((valid_acts.shape[0], 1), generator=g, device=device)
     valid_xt = valid_x0 + (valid_acts - valid_x0) * valid_t
+    # pred: 'v' = the network predicts the velocity x1 - x0; 'x' = it predicts the clean chunk x1
+    pred_type = train_cfg.get('pred', 'v')
+    t_dist = train_cfg.get('t_dist', 'uniform')
+    valid_target = valid_acts if pred_type == 'x' else valid_acts - valid_x0
+
+    @torch.no_grad()
+    def compute_valid_loss(model):
+        # mean squared error over the whole valid set, in chunks to keep the activation memory small
+        total = 0.0
+        for o, x, t, y in zip(*(v.split(65536) for v in (valid_obs, valid_xt, valid_t, valid_target))):
+            total += ((model(o, x, t) - y) ** 2).sum()
+        return total / valid_target.numel()
+
+    # keep_every: also keep ckpt_<step>.pt every keep_every steps (and at step 0), for success-vs-steps curves
+    keep_every = train_cfg.get('keep_every')
+    if keep_every:
+        save_checkpoint(run_dir, eval_model, model_kwargs, act_normalizer, config, 0, name='ckpt_0.pt')
     for step in range(n_steps):
         optimizer.zero_grad()
         idx = torch.randint(0, N, (batch_size,), device=device)
@@ -87,34 +126,40 @@ if __name__ == '__main__':
 
         # generate noise and t
         x0 = torch.randn_like(gt_act, device=device)
-        t = torch.rand(batch_size, 1, device=device)
+        t = sample_t(batch_size, t_dist)
         xt = x0 + (gt_act - x0) * t
 
-        pred_vel = bc_model(obs_batch, xt, t)
-        loss = ((pred_vel - (gt_act - x0)) ** 2).mean()
+        pred = train_model(obs_batch, xt, t)
+        target = gt_act if pred_type == 'x' else gt_act - x0
+        loss = ((pred - target) ** 2).mean()
         loss.backward()
         optimizer.step()
+        if scheduler:
+            scheduler.step()
+        if ema_decay:
+            with torch.no_grad():
+                torch._foreach_lerp_(ema_params, params, 1 - ema_decay)  # all tensors in one launch
         logger.log_train(step, loss)
 
         # validation
         if step % train_cfg['valid_every'] == 0 and step > 0:
-            bc_model.eval()
-            with torch.no_grad():
-                valid_loss = ((bc_model(valid_obs, valid_xt, valid_t) - (valid_acts - valid_x0)) ** 2).mean()
-            bc_model.train()
+            eval_model.eval()
+            valid_loss = compute_valid_loss(eval_model)
+            eval_model.train()
             logger.log_valid(step, valid_loss)
 
         # periodic checkpoint, overwritten each time so the run dir always has the latest one
         if (step + 1) % train_cfg['save_every'] == 0 and step + 1 < n_steps:
-            save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, step + 1)
+            save_checkpoint(run_dir, eval_model, model_kwargs, act_normalizer, config, step + 1)
+        if keep_every and (step + 1) % keep_every == 0:
+            save_checkpoint(run_dir, eval_model, model_kwargs, act_normalizer, config, step + 1, name=f'ckpt_{step + 1}.pt')
 
-    save_checkpoint(run_dir, bc_model, model_kwargs, act_normalizer, config, n_steps)
+    save_checkpoint(run_dir, eval_model, model_kwargs, act_normalizer, config, n_steps)
     logger.plot(os.path.join(run_dir, 'loss.png'))
 
     # final validation loss for the results table
-    bc_model.eval()
-    with torch.no_grad():
-        valid_loss = ((bc_model(valid_obs, valid_xt, valid_t) - (valid_acts - valid_x0)) ** 2).mean().item()
+    eval_model.eval()
+    valid_loss = compute_valid_loss(eval_model).item()
     with open(os.path.join(run_dir, 'train_summary.json'), 'w') as f:
         json.dump(dict(valid_loss=valid_loss), f, indent=2)
     print(f"final valid loss {valid_loss:.6f}")
